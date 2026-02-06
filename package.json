@@ -1,0 +1,24 @@
+{
+	"name": "torbox-file-index",
+	"version": "0.0.0",
+	"private": true,
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"deploy": "wrangler deploy",
+		"dev": "wrangler dev",
+		"start": "wrangler dev",
+		"cf-typegen": "wrangler types",
+		"lint": "oxlint --fix .; oxfmt ."
+	},
+	"devDependencies": {
+		"@types/node": "^25.2.1",
+		"ox-standard": "github:JohnDeved/ox-standard",
+		"typescript": "^5.5.2",
+		"wrangler": "^4.63.0"
+	},
+	"dependencies": {
+		"eta": "^3.5.0",
+		"p-retry": "^7.1.0",
+		"valibot": "^1.1.0"
+	}
+}
