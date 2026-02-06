@@ -1,4 +1,3 @@
-import * as v from 'valibot'
 import {
   compileFilter,
   filterAndSortContainers,
@@ -17,7 +16,6 @@ import {
 const DEFAULT_FILTER = '.+'
 const DEFAULT_FLAGS = 'i'
 const DEFAULT_LIMIT = 2000
-const MAX_LIMIT = 10000
 const LOCAL_IPS = new Set(['::1', '127.0.0.1', '0.0.0.0'])
 const SOURCES: Source[] = ['torrents', 'webdl', 'usenet']
 const RATE_LIMIT_WINDOW_MS = 60_000
@@ -31,32 +29,18 @@ const keyChurnState = new Map<string, { keys: Set<string>; resetAt: number }>()
 
 const HEADERS = {
   'Content-Type': 'text/html; charset=utf-8',
-  'Cache-Control': 'private, no-store',
+  'Cache-Control': 'private, no-store, no-transform',
   'X-Robots-Tag': 'noindex, nofollow',
 }
 
-const QuerySchema = v.object({
-  key: v.pipe(v.string(), v.minLength(1, 'Missing required parameter: key')),
-  filter: v.string(),
-  flags: v.string(),
-  limit: v.pipe(
-    v.string(),
-    v.transform(Number),
-    v.number(),
-    v.integer(),
-    v.minValue(1),
-    v.maxValue(MAX_LIMIT)
-  ),
-  sortC: v.picklist(['N', 'S', 'D']),
-  sortO: v.picklist(['A', 'D']),
-})
-
-type Query = v.InferOutput<typeof QuerySchema>
+function normalizeFilterValue(raw: string): string {
+  return raw.includes('.nsz') && !raw.includes('.nsp') ? `${raw},.nsp` : raw
+}
 
 function textResponse(status: number, msg: string): Response {
   return new Response(msg, {
     status,
-    headers: { 'Content-Type': 'text/plain', 'Cache-Control': 'private, no-store' },
+    headers: { 'Content-Type': 'text/plain', 'Cache-Control': 'private, no-store, no-transform' },
   })
 }
 
@@ -124,41 +108,101 @@ function isRateLimited(ip: string | undefined, key: string): boolean {
   return false
 }
 
-function parseQuery(request: Request): Query | Response {
-  const params = new URL(request.url).searchParams
-  const parsed = v.safeParse(QuerySchema, {
-    key: params.get('key') ?? '',
-    filter: params.get('filter') ?? DEFAULT_FILTER,
-    flags: params.get('flags') ?? DEFAULT_FLAGS,
-    limit: params.get('limit') ?? String(DEFAULT_LIMIT),
-    sortC: (params.get('C') ?? 'N').toUpperCase(),
-    sortO: (params.get('O') ?? 'A').toUpperCase(),
-  })
+interface Query {
+  key: string
+  filter: string
+  flags: string
+  limit: number
+  sortC: SortColumn
+  sortO: SortOrder
+}
 
-  if (!parsed.success) {
-    const firstIssue = parsed.issues[0]?.message ?? `Invalid limit (1-${MAX_LIMIT})`
-    return textResponse(400, firstIssue)
+function parseQuery(): Query {
+  return {
+    key: '',
+    filter: DEFAULT_FILTER,
+    flags: DEFAULT_FLAGS,
+    limit: DEFAULT_LIMIT,
+    sortC: 'N',
+    sortO: 'A',
+  }
+}
+
+function splitPath(pathname: string): string[] {
+  return pathname.split('/').filter(Boolean)
+}
+
+function hasKeyInPath(pathname: string): boolean {
+  const parts = splitPath(pathname)
+  if (parts.length === 0) return false
+  const first = parts[0] as Source
+  return !SOURCES.includes(first)
+}
+
+type ParsedRoute =
+  | { source?: Source; containerId?: number }
+  | { download: true; source: Source; containerId: number; fileId: number }
+
+const SOURCE_SHORT: Record<Source, 't' | 'w' | 'u'> = {
+  torrents: 't',
+  webdl: 'w',
+  usenet: 'u',
+}
+
+const SHORT_SOURCE: Record<string, Source> = {
+  t: 'torrents',
+  w: 'webdl',
+  u: 'usenet',
+}
+
+function splitFilterAndRouteParts(parts: string[]): { filter?: string; routeParts: string[] } {
+  if (parts.length === 0) return { routeParts: parts }
+  const first = parts[0] || ''
+  if (first === 'f' || SOURCES.includes(first as Source) || /^([twu])-\d+$/.test(first)) {
+    return { routeParts: parts }
+  }
+  if (!first.startsWith('.')) return { routeParts: parts }
+  return { filter: normalizeFilterValue(decodeURIComponent(first)), routeParts: parts.slice(1) }
+}
+
+function parseContainerSlug(slug: string): { source: Source; containerId: number } | null {
+  const m = /^([twu])-(\d+)$/.exec(slug)
+  if (!m) return null
+  const source = SHORT_SOURCE[m[1] || '']
+  const containerId = Number.parseInt(m[2] || '', 10)
+  if (!source || !Number.isInteger(containerId) || containerId < 1) return null
+  return { source, containerId }
+}
+
+function parsePath(pathname: string, keyInPath: boolean): ParsedRoute | Response {
+  const fullParts = splitPath(pathname)
+  const pathParts = keyInPath ? fullParts.slice(1) : fullParts
+  const parts = keyInPath ? splitFilterAndRouteParts(pathParts).routeParts : pathParts
+  if (parts.length === 0) return {}
+
+  if (parts[0] === 'f') {
+    if (parts.length !== 4) return textResponse(404, 'Not found')
+    const source = parts[1] as Source
+    if (!SOURCES.includes(source)) return textResponse(404, 'Not found')
+    const containerId = Number.parseInt(parts[2], 10)
+    const idPart = parts[3] || ''
+    const fileId = Number.parseInt(idPart.split('.', 1)[0] || '', 10)
+    if (!Number.isInteger(containerId) || containerId < 1) return textResponse(404, 'Not found')
+    if (!Number.isInteger(fileId) || fileId < 0) return textResponse(404, 'Not found')
+    return { download: true, source, containerId, fileId }
   }
 
-  return parsed.output
-}
-
-function buildBaseQuery(query: Query): URLSearchParams {
-  const params = new URLSearchParams()
-  params.set('key', query.key)
-  if (query.filter !== DEFAULT_FILTER) params.set('filter', query.filter)
-  if (query.flags !== DEFAULT_FLAGS) params.set('flags', query.flags)
-  if (query.limit !== DEFAULT_LIMIT) params.set('limit', String(query.limit))
-  return params
-}
-
-function withPath(path: string, queryString: string): string {
-  return queryString ? `${path}?${queryString}` : path
-}
-
-function parsePath(pathname: string): { source?: Source; containerId?: number } | Response {
-  const parts = pathname.split('/').filter(Boolean)
-  if (parts.length === 0) return {}
+  const slugRoute = parseContainerSlug(parts[0] || '')
+  if (slugRoute) {
+    if (parts.length === 1) return slugRoute
+    if (parts.length === 2) {
+      const idPart = parts[1] || ''
+      const fileId = Number.parseInt(idPart.split('.', 1)[0] || '', 10)
+      if (!Number.isInteger(fileId) || fileId < 0) return textResponse(404, 'Not found')
+      return { download: true, source: slugRoute.source, containerId: slugRoute.containerId, fileId }
+    }
+    return textResponse(404, 'Not found')
+  }
 
   const source = parts[0] as Source
   if (!SOURCES.includes(source)) return textResponse(404, 'Not found')
@@ -168,18 +212,31 @@ function parsePath(pathname: string): { source?: Source; containerId?: number } 
   const containerId = Number.parseInt(parts[1], 10)
   if (!Number.isInteger(containerId) || containerId < 1) return textResponse(404, 'Not found')
 
-  if (parts.length > 2) return textResponse(404, 'Not found')
+  if (parts.length === 2) return { source, containerId }
 
-  return { source, containerId }
+  if (parts.length === 3) {
+    const idPart = parts[2] || ''
+    const fileId = Number.parseInt(idPart.split('.', 1)[0] || '', 10)
+    if (!Number.isInteger(fileId) || fileId < 0) return textResponse(404, 'Not found')
+    return { download: true, source, containerId, fileId }
+  }
+
+  return textResponse(404, 'Not found')
 }
 
-function parentEntry(parentPath: string, baseQuery: URLSearchParams): ListingEntry {
+function parentEntry(parentPath: string): ListingEntry {
   return {
-    href: withPath(parentPath, baseQuery.toString()),
+    href: parentPath,
     name: '../',
     size: undefined,
     description: 'parent directory',
   }
+}
+
+function fileRouteHref(fileId: number, name: string): string {
+  const m = /\.([A-Za-z0-9]{2,8})$/.exec(name)
+  const ext = m ? `.${m[1].toLowerCase()}` : ''
+  return `${fileId}${ext}`
 }
 
 export default {
@@ -189,24 +246,49 @@ export default {
         status: 405,
         headers: {
           'Content-Type': 'text/plain',
-          'Cache-Control': 'private, no-store',
+          'Cache-Control': 'private, no-store, no-transform',
           Allow: 'GET, HEAD',
         },
       })
     }
 
-    const query = parseQuery(request)
-    if (query instanceof Response) return query
+    const query = parseQuery()
+
+    const url = new URL(request.url)
+    const keyInPath = hasKeyInPath(url.pathname)
+    const routeParts = splitPath(url.pathname)
+    const keyFromPath = keyInPath ? decodeURIComponent(routeParts[0] || '') : ''
+    const tailParts = keyInPath ? routeParts.slice(1) : routeParts
+    const { filter: pathFilter } = keyInPath
+      ? splitFilterAndRouteParts(tailParts)
+      : { filter: undefined as string | undefined }
+
+    if (keyInPath && !url.pathname.endsWith('/')) {
+      const { routeParts: routeOnly } = splitFilterAndRouteParts(tailParts)
+      if (routeOnly[0] !== 'f') {
+        return Response.redirect(`${url.origin}${url.pathname}/`, 302)
+      }
+    }
+
+    const key = query.key || keyFromPath
+    if (!key) return textResponse(400, 'Missing required parameter: key')
 
     const userIp = getUserIp(request)
-    if (isRateLimited(userIp, query.key)) return textResponse(429, 'Too many requests')
+    if (isRateLimited(userIp, key)) return textResponse(429, 'Too many requests')
 
-    const route = parsePath(new URL(request.url).pathname)
+    const route = parsePath(url.pathname, keyInPath)
     if (route instanceof Response) return route
+
+    if ('download' in route) {
+      const redirectUrl = buildDownloadUrl(route.source, key, route.containerId, route.fileId)
+      return Response.redirect(redirectUrl, 302)
+    }
+
+    const effectiveFilter = pathFilter || query.filter
 
     let compiledFilter
     try {
-      compiledFilter = compileFilter(query.filter, query.flags)
+      compiledFilter = compileFilter(effectiveFilter, query.flags)
     } catch (error) {
       return textResponse(
         400,
@@ -214,12 +296,11 @@ export default {
       )
     }
 
-    const baseQuery = buildBaseQuery(query)
-    const sortBaseQuery = baseQuery.toString()
+    const sortBaseQuery = ''
 
     if (!route.source) {
       const settled = await Promise.allSettled(
-        SOURCES.map(source => fetchContainersBySource(source, query.key))
+        SOURCES.map(source => fetchContainersBySource(source, key))
       )
       const allContainers = [] as Awaited<ReturnType<typeof fetchContainersBySource>>
       const errors: string[] = []
@@ -243,9 +324,8 @@ export default {
         query.sortC as SortColumn,
         query.sortO as SortOrder
       )
-
       const entries: ListingEntry[] = filtered.map(container => ({
-        href: withPath(`/${container.source}/${container.container_id}/`, baseQuery.toString()),
+        href: `${SOURCE_SHORT[container.source]}-${container.container_id}/`,
         name: `${container.container_name}/`,
         size: container.files.reduce((sum, file) => sum + file.size, 0),
         description: `${container.source} | ${container.files.length} file(s)`,
@@ -255,7 +335,7 @@ export default {
         title: 'Index of /',
         entries,
         displayedCount: filtered.length,
-        filter: query.filter,
+        filter: effectiveFilter,
         totalMatched,
         limit: query.limit,
         errors,
@@ -268,7 +348,7 @@ export default {
     if (!route.containerId) {
       let containers
       try {
-        containers = await fetchContainersBySource(route.source, query.key)
+        containers = await fetchContainersBySource(route.source, key)
       } catch {
         return textResponse(502, 'Upstream provider unavailable')
       }
@@ -280,11 +360,10 @@ export default {
         query.sortC as SortColumn,
         query.sortO as SortOrder
       )
-
       const entries: ListingEntry[] = [
-        parentEntry('/', baseQuery),
+        parentEntry('../'),
         ...filtered.map(container => ({
-          href: withPath(`/${route.source}/${container.container_id}/`, baseQuery.toString()),
+          href: `${container.container_id}/`,
           name: `${container.container_name}/`,
           size: container.files.reduce((sum, file) => sum + file.size, 0),
           description: `${container.files.length} file(s)`,
@@ -295,7 +374,7 @@ export default {
         title: `Index of /${route.source}/`,
         entries,
         displayedCount: filtered.length,
-        filter: query.filter,
+        filter: effectiveFilter,
         totalMatched,
         limit: query.limit,
         errors: [],
@@ -309,7 +388,7 @@ export default {
     try {
       container = await fetchContainerById(
         route.source,
-        query.key,
+        key,
         route.containerId
       )
     } catch {
@@ -327,14 +406,9 @@ export default {
     )
 
     const entries: ListingEntry[] = [
-      parentEntry('/', baseQuery),
+      parentEntry('../'),
       ...files.map(file => ({
-        href: buildDownloadUrl(
-          file.source,
-          query.key,
-          file.container_id,
-          file.file_id
-        ),
+        href: fileRouteHref(file.file_id, file.display_name),
         name: file.display_name,
         size: file.size,
         description: 'file',
@@ -345,7 +419,7 @@ export default {
       title: `Index of /${route.source}/${container.container_id}/`,
       entries,
       displayedCount: files.length,
-      filter: query.filter,
+      filter: effectiveFilter,
       totalMatched,
       limit: query.limit,
       errors: [],

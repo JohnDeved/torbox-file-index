@@ -6,13 +6,7 @@ export interface RenderRow {
 
 export interface RenderTemplateData {
   title: string
-  warningsHtml: string
-  nameSortHref: string
-  sizeSortHref: string
-  descSortHref: string
-  nameHeader: string
   rowsHtml: string
-  summary: string
 }
 
 const eta = new Eta({ autoEscape: true })
@@ -30,18 +24,14 @@ const DIRECTORY_TEMPLATE = dedent(String.raw/* html */ `
   <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
   <html>
    <head>
+    <meta charset="utf-8">
     <title><%= it.title %></title>
    </head>
    <body>
     <h1><%= it.title %></h1>
-  <%~ it.warningsHtml %>
   <pre>
-        <a href="<%= it.nameSortHref %>"><%= it.nameHeader %></a> <a href="<%= it.sizeSortHref %>">Size</a>  <a href="<%= it.descSortHref %>">Description</a>
-  <hr>
   <%~ it.rowsHtml %>
-  <hr>
   </pre>
-    <address><%= it.summary %></address>
    </body>
   </html>
 `)

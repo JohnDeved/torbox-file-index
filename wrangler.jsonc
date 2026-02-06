@@ -4,7 +4,7 @@
 	"main": "src/index.ts",
 	"compatibility_date": "2026-02-05",
 	"observability": {
-		"enabled": true
+		"enabled": false
 	},
 	"compatibility_flags": ["nodejs_compat"],
 	"routes": [
