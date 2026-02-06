@@ -20,6 +20,14 @@ const DEFAULT_LIMIT = 2000
 const MAX_LIMIT = 10000
 const LOCAL_IPS = new Set(['::1', '127.0.0.1', '0.0.0.0'])
 const SOURCES: Source[] = ['torrents', 'webdl', 'usenet']
+const RATE_LIMIT_WINDOW_MS = 60_000
+const RATE_LIMIT_MAX_REQUESTS_PER_IP = 240
+const RATE_LIMIT_MAX_REQUESTS_PER_IP_KEY = 240
+const RATE_LIMIT_MAX_UNIQUE_KEYS_PER_IP = 3
+const RATE_LIMIT_STATE_SOFT_MAX = 10_000
+const ipRateLimitState = new Map<string, { count: number; resetAt: number }>()
+const keyRateLimitState = new Map<string, { count: number; resetAt: number }>()
+const keyChurnState = new Map<string, { keys: Set<string>; resetAt: number }>()
 
 const HEADERS = {
   'Content-Type': 'text/html; charset=utf-8',
@@ -39,10 +47,8 @@ const QuerySchema = v.object({
     v.minValue(1),
     v.maxValue(MAX_LIMIT)
   ),
-  bypassCache: v.boolean(),
   sortC: v.picklist(['N', 'S', 'D']),
   sortO: v.picklist(['A', 'D']),
-  userIp: v.optional(v.string()),
 })
 
 type Query = v.InferOutput<typeof QuerySchema>
@@ -54,15 +60,68 @@ function textResponse(status: number, msg: string): Response {
   })
 }
 
-function getUserIp(request: Request, override: string | null): string | undefined {
-  const raw =
-    override ||
-    request.headers.get('cf-connecting-ip') ||
-    request.headers.get('x-forwarded-for') ||
-    ''
+function getUserIp(request: Request): string | undefined {
+  const raw = request.headers.get('cf-connecting-ip') || ''
   const first = raw.split(',')[0]?.trim()
   if (!first || LOCAL_IPS.has(first)) return undefined
   return first
+}
+
+function pruneCounterMap(map: Map<string, { count: number; resetAt: number }>, now: number): void {
+  if (map.size <= RATE_LIMIT_STATE_SOFT_MAX) return
+  for (const [key, value] of map) {
+    if (now >= value.resetAt) map.delete(key)
+  }
+}
+
+function pruneKeyChurnMap(now: number): void {
+  if (keyChurnState.size <= RATE_LIMIT_STATE_SOFT_MAX) return
+  for (const [key, value] of keyChurnState) {
+    if (now >= value.resetAt) keyChurnState.delete(key)
+  }
+}
+
+function consumeRateLimit(
+  map: Map<string, { count: number; resetAt: number }>,
+  bucket: string,
+  maxRequests: number,
+  now: number
+): boolean {
+  pruneCounterMap(map, now)
+  const current = map.get(bucket)
+  if (!current || now >= current.resetAt) {
+    map.set(bucket, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS })
+    return false
+  }
+
+  current.count += 1
+  return current.count > maxRequests
+}
+
+function consumeKeyChurnLimit(ipBucket: string, keyValue: string, now: number): boolean {
+  pruneKeyChurnMap(now)
+  const current = keyChurnState.get(ipBucket)
+  if (!current || now >= current.resetAt) {
+    keyChurnState.set(ipBucket, {
+      keys: new Set([keyValue]),
+      resetAt: now + RATE_LIMIT_WINDOW_MS,
+    })
+    return false
+  }
+
+  current.keys.add(keyValue)
+  return current.keys.size > RATE_LIMIT_MAX_UNIQUE_KEYS_PER_IP
+}
+
+function isRateLimited(ip: string | undefined, key: string): boolean {
+  const now = Date.now()
+  const ipBucket = ip || 'unknown'
+  const ipKeyBucket = `${ipBucket}|${key}`
+  if (consumeRateLimit(ipRateLimitState, ipBucket, RATE_LIMIT_MAX_REQUESTS_PER_IP, now)) return true
+  if (consumeRateLimit(keyRateLimitState, ipKeyBucket, RATE_LIMIT_MAX_REQUESTS_PER_IP_KEY, now))
+    return true
+  if (consumeKeyChurnLimit(ipBucket, key, now)) return true
+  return false
 }
 
 function parseQuery(request: Request): Query | Response {
@@ -72,10 +131,8 @@ function parseQuery(request: Request): Query | Response {
     filter: params.get('filter') ?? DEFAULT_FILTER,
     flags: params.get('flags') ?? DEFAULT_FLAGS,
     limit: params.get('limit') ?? String(DEFAULT_LIMIT),
-    bypassCache: params.get('bypass_cache') === 'true',
     sortC: (params.get('C') ?? 'N').toUpperCase(),
     sortO: (params.get('O') ?? 'A').toUpperCase(),
-    userIp: getUserIp(request, params.get('user_ip')),
   })
 
   if (!parsed.success) {
@@ -92,8 +149,6 @@ function buildBaseQuery(query: Query): URLSearchParams {
   if (query.filter !== DEFAULT_FILTER) params.set('filter', query.filter)
   if (query.flags !== DEFAULT_FLAGS) params.set('flags', query.flags)
   if (query.limit !== DEFAULT_LIMIT) params.set('limit', String(query.limit))
-  if (query.bypassCache) params.set('bypass_cache', 'true')
-  if (query.userIp) params.set('user_ip', query.userIp)
   return params
 }
 
@@ -129,8 +184,22 @@ function parentEntry(parentPath: string, baseQuery: URLSearchParams): ListingEnt
 
 export default {
   async fetch(request: Request): Promise<Response> {
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      return new Response('Method not allowed', {
+        status: 405,
+        headers: {
+          'Content-Type': 'text/plain',
+          'Cache-Control': 'private, no-store',
+          Allow: 'GET, HEAD',
+        },
+      })
+    }
+
     const query = parseQuery(request)
     if (query instanceof Response) return query
+
+    const userIp = getUserIp(request)
+    if (isRateLimited(userIp, query.key)) return textResponse(429, 'Too many requests')
 
     const route = parsePath(new URL(request.url).pathname)
     if (route instanceof Response) return route
@@ -141,7 +210,7 @@ export default {
     } catch (error) {
       return textResponse(
         400,
-        `Invalid filter regex: ${error instanceof Error ? error.message : String(error)}`
+        `Invalid filter: ${error instanceof Error ? error.message : String(error)}`
       )
     }
 
@@ -150,7 +219,7 @@ export default {
 
     if (!route.source) {
       const settled = await Promise.allSettled(
-        SOURCES.map(source => fetchContainersBySource(source, query.key, query.bypassCache))
+        SOURCES.map(source => fetchContainersBySource(source, query.key))
       )
       const allContainers = [] as Awaited<ReturnType<typeof fetchContainersBySource>>
       const errors: string[] = []
@@ -160,13 +229,11 @@ export default {
           allContainers.push(...result.value)
           return
         }
-        errors.push(
-          `${SOURCES[idx]}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`
-        )
+        errors.push(`${SOURCES[idx]}: unavailable`)
       })
 
       if (allContainers.length === 0 && errors.length > 0) {
-        return textResponse(502, `All TorBox sources failed:\n${errors.join('\n')}`)
+        return textResponse(502, 'Upstream provider unavailable')
       }
 
       const { containers: filtered, totalMatched } = filterAndSortContainers(
@@ -201,12 +268,9 @@ export default {
     if (!route.containerId) {
       let containers
       try {
-        containers = await fetchContainersBySource(route.source, query.key, query.bypassCache)
-      } catch (error) {
-        return textResponse(
-          502,
-          `${route.source}: ${error instanceof Error ? error.message : String(error)}`
-        )
+        containers = await fetchContainersBySource(route.source, query.key)
+      } catch {
+        return textResponse(502, 'Upstream provider unavailable')
       }
 
       const { containers: filtered, totalMatched } = filterAndSortContainers(
@@ -246,14 +310,10 @@ export default {
       container = await fetchContainerById(
         route.source,
         query.key,
-        query.bypassCache,
         route.containerId
       )
-    } catch (error) {
-      return textResponse(
-        502,
-        `${route.source}: ${error instanceof Error ? error.message : String(error)}`
-      )
+    } catch {
+      return textResponse(502, 'Upstream provider unavailable')
     }
 
     if (!container) return textResponse(404, 'Container not found')
@@ -273,8 +333,7 @@ export default {
           file.source,
           query.key,
           file.container_id,
-          file.file_id,
-          query.userIp
+          file.file_id
         ),
         name: file.display_name,
         size: file.size,

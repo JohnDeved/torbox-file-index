@@ -4,6 +4,16 @@ import type { ContainerEntry, Source, TorBoxItem, TorBoxResponse } from './types
 const API = 'https://api.torbox.app/v1/api'
 const LIST_PAGE_SIZE = 1000
 const FETCH_TIMEOUT_MS = 12000
+const LIST_CACHE_TTL_MS = 15_000
+const CACHE_SOFT_MAX = 2000
+
+interface CacheEntry<T> {
+  value: T
+  expiresAt: number
+}
+
+const sourceListCache = new Map<string, CacheEntry<ContainerEntry[]>>()
+const containerByIdCache = new Map<string, CacheEntry<ContainerEntry | null>>()
 
 const SOURCE_CONFIG: Record<Source, { listPath: string; dlPath: string; idParam: string }> = {
   torrents: { listPath: 'torrents/mylist', dlPath: 'torrents/requestdl', idParam: 'torrent_id' },
@@ -20,8 +30,7 @@ export function buildDownloadUrl(
   source: Source,
   key: string,
   containerId: number,
-  fileId: number,
-  userIp?: string
+  fileId: number
 ): string {
   const cfg = SOURCE_CONFIG[source]
   const params = new URLSearchParams({
@@ -30,12 +39,42 @@ export function buildDownloadUrl(
     file_id: String(fileId),
     redirect: 'true',
   })
-  if (userIp) params.set('user_ip', userIp)
   return `${API}/${cfg.dlPath}?${params}`
 }
 
 function retryableStatus(status: number): boolean {
-  return status === 429 || status >= 500
+  return status >= 500
+}
+
+function cacheGet<T>(map: Map<string, CacheEntry<T>>, key: string): T | undefined {
+  const hit = map.get(key)
+  if (!hit) return undefined
+  if (Date.now() >= hit.expiresAt) {
+    map.delete(key)
+    return undefined
+  }
+  return hit.value
+}
+
+function trimCache<T>(map: Map<string, CacheEntry<T>>): void {
+  if (map.size <= CACHE_SOFT_MAX) return
+  const now = Date.now()
+  for (const [key, value] of map) {
+    if (now >= value.expiresAt) map.delete(key)
+  }
+  if (map.size <= CACHE_SOFT_MAX) return
+  const overflow = map.size - CACHE_SOFT_MAX
+  let removed = 0
+  for (const key of map.keys()) {
+    map.delete(key)
+    removed += 1
+    if (removed >= overflow) break
+  }
+}
+
+function cacheSet<T>(map: Map<string, CacheEntry<T>>, key: string, value: T): void {
+  trimCache(map)
+  map.set(key, { value, expiresAt: Date.now() + LIST_CACHE_TTL_MS })
 }
 
 async function fetchJson(url: string, key: string): Promise<TorBoxResponse> {
@@ -83,16 +122,18 @@ function normalizeContainer(source: Source, item: TorBoxItem): ContainerEntry {
 
 export async function fetchContainersBySource(
   source: Source,
-  key: string,
-  bypassCache: boolean
+  key: string
 ): Promise<ContainerEntry[]> {
+  const cacheKey = `${source}:${key}`
+  const cached = cacheGet(sourceListCache, cacheKey)
+  if (cached) return cached
+
   const cfg = SOURCE_CONFIG[source]
   const containers: ContainerEntry[] = []
 
   let offset = 0
   while (true) {
     const params = new URLSearchParams({
-      bypass_cache: String(bypassCache),
       offset: String(offset),
       limit: String(LIST_PAGE_SIZE),
     })
@@ -109,25 +150,34 @@ export async function fetchContainersBySource(
     offset += LIST_PAGE_SIZE
   }
 
+  cacheSet(sourceListCache, cacheKey, containers)
   return containers
 }
 
 export async function fetchContainerById(
   source: Source,
   key: string,
-  bypassCache: boolean,
   containerId: number
 ): Promise<ContainerEntry | null> {
+  const cacheKey = `${source}:${containerId}:${key}`
+  const cached = cacheGet(containerByIdCache, cacheKey)
+  if (cached !== undefined) return cached
+
   const cfg = SOURCE_CONFIG[source]
   const params = new URLSearchParams({
     id: String(containerId),
-    bypass_cache: String(bypassCache),
     limit: String(LIST_PAGE_SIZE),
   })
   const body = await fetchJson(`${API}/${cfg.listPath}?${params}`, key)
   if (!body.success) throw new Error(`${source}: ${body.detail || body.error || 'unknown error'}`)
 
   const item = toItems(body.data).find(x => x.id === containerId && x.download_present !== false)
-  if (!item || !item.files?.length) return null
-  return normalizeContainer(source, item)
+  if (!item || !item.files?.length) {
+    cacheSet(containerByIdCache, cacheKey, null)
+    return null
+  }
+
+  const normalized = normalizeContainer(source, item)
+  cacheSet(containerByIdCache, cacheKey, normalized)
+  return normalized
 }

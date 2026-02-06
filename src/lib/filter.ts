@@ -1,15 +1,17 @@
 import type { ContainerEntry, FileEntry } from '../torbox'
 
 const MAX_FILTER_LEN = 256
+const MAX_FILTER_TERMS = 24
+const MAX_TERM_LEN = 32
 const NAME_COLLATOR = new Intl.Collator(undefined, { sensitivity: 'base' })
-const ALLOWED_REGEX_FLAGS = new Set(['d', 'g', 'i', 'm', 's', 'u', 'v', 'y'])
 
 export type SortColumn = 'N' | 'S' | 'D'
 export type SortOrder = 'A' | 'D'
 
 export interface CompiledFilter {
-  regex: RegExp
   matchAll: boolean
+  raw: string
+  terms: string[]
 }
 
 export interface FileFilterResult {
@@ -22,28 +24,49 @@ export interface ContainerFilterResult {
   totalMatched: number
 }
 
-function sanitizeFlags(flags: string): string {
-  const out: string[] = []
-  const seen = new Set<string>()
-  for (const flag of flags) {
-    if (!ALLOWED_REGEX_FLAGS.has(flag)) throw new Error(`Invalid regex flag: ${flag}`)
-    if (flag === 'g' || flag === 'y') continue
-    if (!seen.has(flag)) {
-      seen.add(flag)
-      out.push(flag)
-    }
-  }
-  return out.join('')
+function normalizeTerm(term: string): string {
+  let value = term.trim().toLowerCase()
+  if (value.startsWith('*.')) value = value.slice(1)
+  if (!value.startsWith('.')) value = `.${value}`
+  return value
 }
 
-export function compileFilter(pattern: string, flags: string): CompiledFilter {
+function splitTerms(pattern: string): string[] {
+  const terms = pattern
+    .split(/[,\s]+/)
+    .map(part => part.trim())
+    .filter(Boolean)
+
+  if (terms.length > MAX_FILTER_TERMS) {
+    throw new Error(`Too many filter terms (max ${MAX_FILTER_TERMS})`)
+  }
+
+  for (const term of terms) {
+    if (term.length > MAX_TERM_LEN) {
+      throw new Error(`Filter term too long: ${term.slice(0, 12)}... (max ${MAX_TERM_LEN} chars)`)
+    }
+  }
+
+  return terms
+}
+
+function nameMatchesAnyTerm(name: string, terms: string[]): boolean {
+  const normalized = name.toLowerCase()
+  return terms.some(term => normalized.endsWith(term))
+}
+
+export function compileFilter(pattern: string, _flags: string): CompiledFilter {
   if (pattern.length > MAX_FILTER_LEN)
     throw new Error(`Filter too long (max ${MAX_FILTER_LEN} chars)`)
   const normalizedPattern = pattern.trim() || '.*'
-  const regex = new RegExp(normalizedPattern, sanitizeFlags(flags))
   const matchAll =
     normalizedPattern === '.+' || normalizedPattern === '.*' || normalizedPattern === '^.*$'
-  return { regex, matchAll }
+  if (matchAll) return { matchAll: true, raw: normalizedPattern, terms: [] }
+
+  const terms = splitTerms(normalizedPattern).map(normalizeTerm)
+  if (terms.length === 0) return { matchAll: true, raw: normalizedPattern, terms: [] }
+
+  return { matchAll: false, raw: normalizedPattern, terms }
 }
 
 function sortByName(a: string, b: string, order: SortOrder): number {
@@ -63,7 +86,10 @@ export function filterAndSortFiles(
   column: SortColumn,
   order: SortOrder
 ): FileFilterResult {
-  const matched = files.filter(file => compiled.matchAll || compiled.regex.test(file.full_name))
+  const matched = files.filter(file => {
+    if (compiled.matchAll) return true
+    return nameMatchesAnyTerm(file.full_name, compiled.terms)
+  })
 
   matched.sort((a, b) => {
     if (column === 'S') {
@@ -91,8 +117,7 @@ export function filterAndSortContainers(
 ): ContainerFilterResult {
   const matched = containers.filter(container => {
     if (compiled.matchAll) return true
-    if (compiled.regex.test(container.container_name)) return true
-    return container.files.some(file => compiled.regex.test(file.full_name))
+    return container.files.some(file => nameMatchesAnyTerm(file.full_name, compiled.terms))
   })
 
   matched.sort((a, b) => {
