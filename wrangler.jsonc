@@ -6,5 +6,15 @@
 	"observability": {
 		"enabled": true
 	},
-	"compatibility_flags": ["nodejs_compat"]
+	"compatibility_flags": ["nodejs_compat"],
+	"routes": [
+		{
+			"pattern": "tbx.b-j.dev",
+			"custom_domain": true
+		},
+		{
+			"pattern": "torbox-file-index.b-j.dev",
+			"custom_domain": true
+		}
+	]
 }

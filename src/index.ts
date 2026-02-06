@@ -267,7 +267,7 @@ export default {
     )
 
     const entries: ListingEntry[] = [
-      parentEntry(`/${route.source}/`, baseQuery),
+      parentEntry('/', baseQuery),
       ...files.map(file => ({
         href: buildDownloadUrl(
           file.source,
